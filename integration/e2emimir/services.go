@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"github.com/grafana/e2e"
 )
@@ -18,6 +19,10 @@ const (
 	httpPort   = 8080
 	grpcPort   = 9095
 	GossipPort = 9094
+)
+
+var (
+	debugPortOffset = 0
 )
 
 // GetDefaultImage returns the Docker image to use to run Mimir.
@@ -54,12 +59,13 @@ func getExtraFlags() map[string]string {
 func newMimirServiceFromOptions(name string, defaultFlags, flags map[string]string, options ...Option) *MimirService {
 	o := newOptions(options)
 	serviceFlags := o.MapFlags(e2e.MergeFlags(defaultFlags, flags, getExtraFlags()))
-	binaryName := getBinaryNameForBackwardsCompatibility(o.Image)
+	command := getCommand(o.Image)
+	args := getArgs(serviceFlags)
 
 	return NewMimirService(
 		name,
 		o.Image,
-		e2e.NewCommandWithoutEntrypoint(binaryName, e2e.BuildArgs(serviceFlags)...),
+		e2e.NewCommandWithoutEntrypoint(command, args...),
 		e2e.NewHTTPReadinessProbe(o.HTTPPort, "/ready", 200, 299),
 		o.HTTPPort,
 		o.GRPCPort,
@@ -150,8 +156,25 @@ func NewIngester(name string, consulAddress string, flags map[string]string, opt
 	)
 }
 
-func getBinaryNameForBackwardsCompatibility(image string) string {
+func getCommand(image string) string {
+	if image == "mimir" {
+		if debugPort := os.Getenv("DEBUG_PORT"); debugPort != "" {
+			return "sh"
+		}
+	}
 	return "mimir"
+}
+
+func getArgs(flags map[string]string) []string {
+	var args []string
+	if debugPort := os.Getenv("DEBUG_PORT"); debugPort != "" {
+		port, err := strconv.Atoi(debugPort)
+		if err == nil {
+			debugArgs := []string{"-c", fmt.Sprintf("exec ./dlv exec ./mimir --listen=:%d --headless=true --api-version=2 --accept-multiclient --continue", port)}
+			args = append(args, debugArgs...)
+		}
+	}
+	return append(args, e2e.BuildArgs(flags)...)
 }
 
 func NewQueryFrontend(name string, flags map[string]string, options ...Option) *MimirService {
@@ -277,7 +300,7 @@ func NewAlertmanagerWithTLS(name string, flags map[string]string, options ...Opt
 		"-target":    "alertmanager",
 		"-log.level": "warn",
 	}, flags, getExtraFlags()))
-	binaryName := getBinaryNameForBackwardsCompatibility(o.Image)
+	binaryName := getCommand(o.Image)
 
 	return NewMimirService(
 		name,
