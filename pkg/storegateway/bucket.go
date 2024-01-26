@@ -627,6 +627,7 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, srv storegatewaypb.Stor
 		resHints = &hintspb.SeriesResponseHints{}
 	)
 	for _, b := range blocks {
+		level.Info(s.logger).Log("msg", fmt.Sprintf("queried block: %v, minTime: %v, level: %v", b.meta.ULID, b.meta.MinTime, b.meta.Compaction.Level))
 		resHints.AddQueriedBlock(b.meta.ULID)
 	}
 	if err := s.sendHints(srv, resHints); err != nil {
