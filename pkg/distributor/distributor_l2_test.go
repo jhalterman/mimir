@@ -481,6 +481,57 @@ func TestL2Buffer_Push_SizeLimitTrigger(t *testing.T) {
 	}
 }
 
+func TestL2Buffer_TimeoutFlushesUnderContinuousLoad(t *testing.T) {
+	// Regression test: the timeout flush must fire based on when the buffer was first
+	// opened (firstWrite), not when the most recent request arrived (lastWrite).
+	// Under continuous load lastWrite is always fresh, so an age-based check on
+	// lastWrite never reaches BufferDuration and the timeout flush never fires.
+	writer, _ := newTestL2Writer(t)
+	const bufferDuration = 100 * time.Millisecond
+	cfg := L2Config{
+		BufferDuration: bufferDuration,
+		MaxBufferBytes: 100 << 20, // 100 MB: won't trigger size-based flush
+	}
+	buf := NewL2Buffer(cfg, writer, prometheus.NewRegistry(), log.NewNopLogger())
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), buf))
+	t.Cleanup(func() {
+		require.NoError(t, services.StopAndAwaitTerminated(context.Background(), buf))
+	})
+
+	ctx := user.InjectOrgID(context.Background(), "tenant1")
+	req := makeWriteRequest(1000, 1, 0, false, false, "metric")
+
+	// Send the first push and track when it completes.
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- buf.Push(ctx, 0, req) }()
+
+	// Continuously send more pushes at bufferDuration/4 intervals, keeping
+	// lastWrite always fresh. With the bug this prevents the timeout flush
+	// from ever firing, so firstDone never receives.
+	stopSpam := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(bufferDuration / 4)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopSpam:
+				return
+			case <-ticker.C:
+				go buf.Push(ctx, 0, req) //nolint:errcheck
+			}
+		}
+	}()
+	defer close(stopSpam)
+
+	select {
+	case err := <-firstDone:
+		require.NoError(t, err)
+	case <-time.After(5 * bufferDuration):
+		t.Fatal("push did not complete within 5×bufferDuration under continuous load: " +
+			"timeout flush is likely using lastWrite instead of firstWrite")
+	}
+}
+
 func TestL2Buffer_Push_NoTenantIDReturnsError(t *testing.T) {
 	writer, _ := newTestL2Writer(t)
 	buf := NewL2Buffer(L2Config{BufferDuration: 100 * time.Millisecond}, writer, prometheus.NewRegistry(), log.NewNopLogger())

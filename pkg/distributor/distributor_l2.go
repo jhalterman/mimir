@@ -51,10 +51,11 @@ type l2PendingRequest struct {
 
 // l2PartitionBuffer holds pending requests for one (partition, tenant) pair.
 type l2PartitionBuffer struct {
-	mu        sync.Mutex
-	pending   []*l2PendingRequest
-	bytes     int
-	lastWrite time.Time
+	mu         sync.Mutex
+	pending    []*l2PendingRequest
+	bytes      int
+	firstWrite time.Time // when this buffer window opened; used for timeout flush
+	lastWrite  time.Time // most recent write; used for idle eviction
 }
 
 // drain atomically takes all pending requests and resets the buffer state.
@@ -68,6 +69,7 @@ func (b *l2PartitionBuffer) drain() []*l2PendingRequest {
 	pending := b.pending
 	b.pending = nil
 	b.bytes = 0
+	b.firstWrite = time.Time{}
 	return pending
 }
 
@@ -156,6 +158,9 @@ func (b *L2Buffer) Push(ctx context.Context, partitionID int32, req *mimirpb.Wri
 	}
 
 	buf.mu.Lock()
+	if len(buf.pending) == 0 {
+		buf.firstWrite = time.Now()
+	}
 	buf.pending = append(buf.pending, pending)
 	buf.bytes += req.Size()
 	buf.lastWrite = time.Now()
@@ -236,14 +241,15 @@ func (b *L2Buffer) flushExpiredAndEvict(ctx context.Context) {
 	for key, buf := range b.buffers {
 		buf.mu.Lock()
 		hasPending := len(buf.pending) > 0
-		age := now.Sub(buf.lastWrite)
+		openAge := now.Sub(buf.firstWrite)
+		idleAge := now.Sub(buf.lastWrite)
 		exceedsSize := buf.bytes >= int(b.cfg.MaxBufferBytes)
 		buf.mu.Unlock()
 
 		switch {
-		case hasPending && (age >= b.cfg.BufferDuration || exceedsSize):
+		case hasPending && (openAge >= b.cfg.BufferDuration || exceedsSize):
 			toFlush = append(toFlush, candidate{key, buf})
-		case !hasPending && buf.lastWrite != (time.Time{}) && age > 2*b.cfg.BufferDuration:
+		case !hasPending && buf.lastWrite != (time.Time{}) && idleAge > 2*b.cfg.BufferDuration:
 			toEvict = append(toEvict, key)
 		}
 	}
