@@ -244,7 +244,7 @@ func (m *WriteRequest) MinTimestamp() int64 {
 
 // IsEmpty returns whether the WriteRequest has no data to ingest.
 func (m *WriteRequest) IsEmpty() bool {
-	return len(m.Timeseries) == 0 && len(m.Metadata) == 0
+	return len(m.Timeseries) == 0 && len(m.Metadata) == 0 && len(m.TimeseriesRW2) == 0
 }
 
 // MetadataSize is like Size() but returns only the marshalled size of Metadata field.

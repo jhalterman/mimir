@@ -155,12 +155,19 @@ func (v versionOneRecordSerializer) ToRecords(partitionID int32, tenantID string
 type versionTwoRecordSerializer struct{}
 
 func (v versionTwoRecordSerializer) ToRecords(partitionID int32, tenantID string, req *mimirpb.WriteRequest, maxSize int) ([]*kgo.Record, int, error) {
-	inputSize := req.Size() // Capture original RW1 size before conversion
+	inputSize := req.Size() // Capture size before any conversion
 
-	reqv2, err := mimirpb.FromWriteRequestToRW2Request(req, V2CommonSymbols, V2RecordSymbolOffset)
-	defer mimirpb.ReuseRW2(reqv2)
-	if err != nil {
-		return nil, 0, errors.Wrap(err, "failed to convert RW1 request to RW2")
+	var reqv2 *mimirpb.WriteRequest
+	if len(req.SymbolsRW2) > 0 || len(req.TimeseriesRW2) > 0 {
+		// Already RW2 (e.g. produced by the L2 merge path); use as-is.
+		reqv2 = req
+	} else {
+		var err error
+		reqv2, err = mimirpb.FromWriteRequestToRW2Request(req, V2CommonSymbols, V2RecordSymbolOffset)
+		defer mimirpb.ReuseRW2(reqv2)
+		if err != nil {
+			return nil, 0, errors.Wrap(err, "failed to convert RW1 request to RW2")
+		}
 	}
 
 	records, err := marshalWriteRequestToRecords(partitionID, tenantID, reqv2, reqv2.Size(), maxSize, splitRequestVersionTwo)

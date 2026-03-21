@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
+	"github.com/twmb/franz-go/pkg/kgo"
+
 	"github.com/grafana/dskit/flagext"
 	ring_client "github.com/grafana/dskit/ring/client"
 	"github.com/grafana/dskit/services"
@@ -530,6 +532,63 @@ func TestL2Buffer_TimeoutFlushesUnderContinuousLoad(t *testing.T) {
 		t.Fatal("push did not complete within 5×bufferDuration under continuous load: " +
 			"timeout flush is likely using lastWrite instead of firstWrite")
 	}
+}
+
+func TestL2Buffer_FlushWritesDataToKafka(t *testing.T) {
+	// Regression test: mergeRequests produces a WriteRequest with only TimeseriesRW2/SymbolsRW2
+	// set (no RW1 Timeseries). WriteSync calls IsEmpty() which only checks len(Timeseries)==0,
+	// so it treats the merged request as empty and returns nil without writing anything to Kafka.
+	// This causes silent data loss: Push() returns success but no records are produced.
+	cluster, addr := testkafka.CreateCluster(t, 10, kafkaTopic)
+	_ = cluster
+
+	var kafkaCfg ingest.KafkaConfig
+	flagext.DefaultValues(&kafkaCfg)
+	kafkaCfg.Topic = kafkaTopic
+	kafkaCfg.Address = flagext.StringSliceCSV{addr}
+	kafkaCfg.ProducerRecordVersion = 2 // exercise the full RW2 path
+
+	writer := ingest.NewWriter(kafkaCfg, log.NewNopLogger(), prometheus.NewRegistry())
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), writer))
+	t.Cleanup(func() {
+		require.NoError(t, services.StopAndAwaitTerminated(context.Background(), writer))
+	})
+
+	cfg := L2Config{
+		BufferDuration: 50 * time.Millisecond,
+		MaxBufferBytes: 10 << 20,
+	}
+	buf := NewL2Buffer(cfg, writer, prometheus.NewRegistry(), log.NewNopLogger())
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), buf))
+	t.Cleanup(func() {
+		require.NoError(t, services.StopAndAwaitTerminated(context.Background(), buf))
+	})
+
+	const partitionID = int32(0)
+	ctx := user.InjectOrgID(context.Background(), "tenant1")
+	req := makeWriteRequest(1000, 3, 0, false, false, "test_metric")
+
+	require.NoError(t, buf.Push(ctx, partitionID, req))
+
+	// Read back from Kafka. If IsEmpty() silently drops the merged RW2 request,
+	// no records will be produced and PollFetches will time out.
+	consumer, err := kgo.NewClient(
+		kgo.SeedBrokers(addr),
+		kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{
+			kafkaTopic: {partitionID: kgo.NewOffset().AtStart()},
+		}),
+	)
+	require.NoError(t, err)
+	t.Cleanup(consumer.Close)
+
+	fetchCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+
+	fetches := consumer.PollFetches(fetchCtx)
+	require.NoError(t, fetches.Err())
+	require.NotEmpty(t, fetches.Records(),
+		"L2 flush produced no Kafka records: merged RW2 request was silently dropped "+
+			"(IsEmpty does not check TimeseriesRW2)")
 }
 
 func TestL2Buffer_Push_NoTenantIDReturnsError(t *testing.T) {
