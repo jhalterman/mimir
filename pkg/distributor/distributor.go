@@ -21,6 +21,7 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	"github.com/grafana/dskit/backoff"
 	"github.com/grafana/dskit/concurrency"
 	"github.com/grafana/dskit/grpcclient"
 	"github.com/grafana/dskit/grpcutil"
@@ -50,7 +51,9 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/atomic"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 
 	"github.com/grafana/mimir/pkg/cardinality"
 	"github.com/grafana/mimir/pkg/costattribution"
@@ -2696,31 +2699,57 @@ func (d *Distributor) pushToL2(ctx context.Context, partitionID int32, _ string,
 
 	owner := pickL2Owner(partitionID, rs.Instances)
 
-	// Short-circuit: if this pod owns the partition, push directly into the local L2 buffer
-	// rather than encoding, serialising over gRPC, and decoding again. This avoids holding
-	// the same request in memory three times (encoded send buffer, received frame buffer, and
-	// decoded WriteRequest) for the full buffer-duration window.
-	if d.distributorsLifecycler != nil && owner.Addr == d.distributorsLifecycler.GetInstanceAddr() {
-		return d.l2Buffer.Push(ctx, partitionID, req)
-	}
-
-	poolClient, err := d.l2ClientPool.GetClientForInstance(owner)
-	if err != nil {
-		return errors.Wrapf(err, "get L2 client for instance %s", owner.Id)
-	}
-
 	// Forward all incoming gRPC metadata (org ID, cluster validation, trace headers, etc.)
 	// from the L1 request context to the outgoing L2 call.
 	if md, ok := metadata.FromIncomingContext(ctx); ok {
 		ctx = metadata.NewOutgoingContext(ctx, md)
 	}
 
+	candidates := rs.Instances
+	b := backoff.New(ctx, d.cfg.L2Config.RetryConfig)
+	attempt := 0
+	for {
+		attempt++
+		err = d.callL2(ctx, owner, partitionID, req)
+		code := status.Code(err)
+		if err == nil || (code != codes.Unavailable && code != codes.Unknown && code != codes.Canceled) || len(candidates) <= 1 {
+			if err != nil {
+				level.Warn(d.log).Log("msg", "failed to push to L2", "partition", partitionID, "l2_instance", owner.Id, "attempt", attempt, "err", err)
+			}
+			return err
+		}
+		// Remove the failed instance and pick the next candidate before deciding whether to retry.
+		candidates = slices.DeleteFunc(slices.Clone(candidates), func(inst ring.InstanceDesc) bool {
+			return inst.Id == owner.Id
+		})
+		nextOwner := pickL2Owner(partitionID, candidates)
+		if !b.Ongoing() {
+			level.Warn(d.log).Log("msg", "failed to push to L2, retries exhausted", "partition", partitionID, "l2_instance", owner.Id, "attempt", attempt, "err", err)
+			return err
+		}
+		level.Warn(d.log).Log("msg", "failed to push to L2, retrying", "partition", partitionID, "failed_l2_instance", owner.Id, "next_l2_instance", nextOwner.Id, "attempt", attempt, "err", err)
+		owner = nextOwner
+		b.Wait()
+	}
+}
+
+// callL2 sends a PushToPartition request to the given L2 instance, short-circuiting to the
+// local buffer if the instance is this pod.
+func (d *Distributor) callL2(ctx context.Context, owner ring.InstanceDesc, partitionID int32, req *mimirpb.WriteRequest) error {
+	if d.distributorsLifecycler != nil && owner.Addr == d.distributorsLifecycler.GetInstanceAddr() {
+		return d.l2Buffer.Push(ctx, partitionID, req)
+	}
+	poolClient, err := d.l2ClientPool.GetClientForInstance(owner)
+	if err != nil {
+		return errors.Wrapf(err, "get L2 client for instance %s", owner.Id)
+	}
 	_, err = poolClient.(L2DistributorClient).PushToPartition(ctx, &distributorpb.PushToPartitionRequest{
 		PartitionId: partitionID,
 		Request:     req,
 	})
 	return err
 }
+
 
 // pickL2Owner uses jump consistent hash to assign a partition to one of the sorted instances.
 func pickL2Owner(partitionID int32, sortedInstances []ring.InstanceDesc) ring.InstanceDesc {

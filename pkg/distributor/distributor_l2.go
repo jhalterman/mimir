@@ -4,16 +4,20 @@ package distributor
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"sync"
 	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	"github.com/grafana/dskit/backoff"
 	"github.com/grafana/dskit/services"
 	"github.com/grafana/dskit/tenant"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/grafana/mimir/pkg/mimirpb"
 	"github.com/grafana/mimir/pkg/storage/ingest"
@@ -28,12 +32,18 @@ const (
 type L2Config struct {
 	BufferDuration time.Duration `yaml:"buffer_duration"`
 	MaxBufferBytes int64         `yaml:"max_buffer_bytes"`
+	RetryConfig    backoff.Config `yaml:"retry"`
 }
 
 // RegisterFlagsWithPrefix adds flags for L2Config to f.
 func (cfg *L2Config) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 	f.DurationVar(&cfg.BufferDuration, prefix+"buffer-duration", 200*time.Millisecond, "How long to buffer per-partition requests before flushing to Warpstream.")
 	f.Int64Var(&cfg.MaxBufferBytes, prefix+"max-buffer-bytes", 6*1024*1024, "Maximum buffered bytes per partition before triggering an early flush.")
+	cfg.RetryConfig.RegisterFlagsWithPrefix(prefix+"retry", f)
+	// Override defaults: no delay between retries since each attempt routes to a different instance.
+	cfg.RetryConfig.MinBackoff = 0
+	cfg.RetryConfig.MaxBackoff = 0
+	cfg.RetryConfig.MaxRetries = 4
 }
 
 // l2BufferKey identifies a buffer by partition and tenant.
@@ -136,6 +146,10 @@ func NewL2Buffer(cfg L2Config, writer *ingest.Writer, reg prometheus.Registerer,
 // Push enqueues req into the buffer for (partitionID, tenant-from-ctx) and blocks until the
 // flush that includes this request completes (or the context is cancelled).
 func (b *L2Buffer) Push(ctx context.Context, partitionID int32, req *mimirpb.WriteRequest) error {
+	if b.State() != services.Running {
+		return status.Error(codes.Unavailable, "L2 buffer is not running")
+	}
+
 	tenantID, err := tenant.TenantID(ctx)
 	if err != nil {
 		return err
@@ -298,6 +312,9 @@ func (b *L2Buffer) flush(ctx context.Context, key l2BufferKey, pending []*l2Pend
 	b.bytesAfterMerge.Add(float64(merged.Size()))
 
 	err = b.writer.WriteSync(ctx, key.partitionID, key.tenantID, merged)
+	if errors.Is(err, ingest.ErrWriterNotRunning) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		err = status.Error(codes.Unavailable, err.Error())
+	}
 	signal(pending, err)
 }
 
