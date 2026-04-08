@@ -14,8 +14,7 @@ import (
 // converted to RW2 as needed, then all per-request symbol tables are merged into one, and every
 // symbol reference is remapped to the unified table.
 //
-// The caller retains ownership of the input requests; mergeRequests may mutate the LabelsRefs
-// slices of any RW2 timeseries it encounters (remapping them in-place).
+// The caller retains ownership of the input requests; mergeRequests does not mutate them.
 func mergeRequests(reqs []*mimirpb.WriteRequest) (*mimirpb.WriteRequest, error) {
 	if len(reqs) == 0 {
 		return &mimirpb.WriteRequest{}, nil
@@ -74,12 +73,25 @@ func mergeRequests(reqs []*mimirpb.WriteRequest) (*mimirpb.WriteRequest, error) 
 
 		// Remap all symbol references in every timeseries and append to the output.
 		for i := range rw2.TimeseriesRW2 {
-			ts := &rw2.TimeseriesRW2[i]
+			src := &rw2.TimeseriesRW2[i]
+
+			// Copy the struct so we don't mutate the source request's fields. The LabelsRefs
+			// slice needs its own backing array so that in-place remapping doesn't corrupt
+			// the caller's data (e.g. if the same request is retried after a failed flush).
+			ts := *src
+			ts.LabelsRefs = make([]uint32, len(src.LabelsRefs))
+			copy(ts.LabelsRefs, src.LabelsRefs)
 
 			remapRefs(ts.LabelsRefs, remap)
 
-			for j := range ts.Exemplars {
-				remapRefs(ts.Exemplars[j].LabelsRefs, remap)
+			if len(src.Exemplars) > 0 {
+				ts.Exemplars = make([]mimirpb.ExemplarRW2, len(src.Exemplars))
+				copy(ts.Exemplars, src.Exemplars)
+				for j := range ts.Exemplars {
+					ts.Exemplars[j].LabelsRefs = make([]uint32, len(src.Exemplars[j].LabelsRefs))
+					copy(ts.Exemplars[j].LabelsRefs, src.Exemplars[j].LabelsRefs)
+					remapRefs(ts.Exemplars[j].LabelsRefs, remap)
+				}
 			}
 
 			if ts.Metadata.HelpRef > 0 && int(ts.Metadata.HelpRef) < remapLen {
@@ -89,7 +101,7 @@ func mergeRequests(reqs []*mimirpb.WriteRequest) (*mimirpb.WriteRequest, error) 
 				ts.Metadata.UnitRef = remap[ts.Metadata.UnitRef]
 			}
 
-			allTimeseries = append(allTimeseries, *ts)
+			allTimeseries = append(allTimeseries, ts)
 		}
 	}
 
