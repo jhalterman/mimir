@@ -30,8 +30,8 @@ const (
 
 // L2Config holds configuration for the L2 distributor buffer.
 type L2Config struct {
-	BufferDuration time.Duration `yaml:"buffer_duration"`
-	MaxBufferBytes int64         `yaml:"max_buffer_bytes"`
+	BufferDuration time.Duration  `yaml:"buffer_duration"`
+	MaxBufferBytes int64          `yaml:"max_buffer_bytes"`
 	RetryConfig    backoff.Config `yaml:"retry"`
 }
 
@@ -189,6 +189,17 @@ func (b *L2Buffer) Push(ctx context.Context, partitionID int32, req *mimirpb.Wri
 	case err := <-pending.done:
 		return err
 	case <-ctx.Done():
+		// The flush goroutine still holds a reference to req and may be reading
+		// req.Timeseries[*].Samples (via the merged WriteRequest). If we return
+		// immediately, the caller's cleanup (ReuseSlice) can return those Timeseries
+		// to the pool, where another goroutine overwrites the Samples backing array.
+		// That causes a data race: Size() and MarshalToSizedBuffer() read different
+		// data, producing a buffer-overflow panic in WriteRequest.MarshalToSizedBuffer.
+		//
+		// We wait for the flush to finish before returning so the caller cannot free
+		// the request until we are completely done with it. The flush always completes
+		// within at most one BufferDuration, so this wait is bounded.
+		<-pending.done
 		return ctx.Err()
 	}
 }
