@@ -4,6 +4,7 @@ package ingester
 
 import (
 	"context"
+	"errors"
 	"math"
 	"testing"
 	"time"
@@ -308,5 +309,66 @@ func TestRecomputeOwnedSeries(t *testing.T) {
 		require.Equal(t, 10, db.ownedState.ownedSeriesCount)
 		require.Equal(t, 5, db.ownedState.shardSize)
 		require.Equal(t, math.MaxInt32, db.ownedState.localSeriesLimit)
+	})
+}
+
+// fakeOOOPanicker exists so that its method name "compactOOO" appears in panic
+// stack traces, exercising the OOO-detection substring match in
+// (*userTSDB).compactWithPanicRecovery.
+type fakeOOOPanicker struct{}
+
+//nolint:revive // method name intentionally matches the runtime substring we filter on
+func (fakeOOOPanicker) compactOOO() error {
+	panic("simulated OOO compaction panic")
+}
+
+func panicOutsideOOO() error {
+	panic("simulated non-OOO panic")
+}
+
+func TestUserTSDB_compactWithPanicRecovery(t *testing.T) {
+	tsdbDB, err := tsdb.Open(t.TempDir(), promslog.NewNopLogger(), nil, tsdb.DefaultOptions(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, tsdbDB.Close()) })
+
+	u := &userTSDB{
+		db:     tsdbDB,
+		userID: "test",
+		logger: log.NewNopLogger(),
+	}
+
+	withSwallow := func(t *testing.T, enabled bool) {
+		t.Helper()
+		orig := swallowOOOCompactionPanic
+		t.Cleanup(func() { swallowOOOCompactionPanic = orig })
+		swallowOOOCompactionPanic = enabled
+	}
+
+	t.Run("no panic: inner error is returned as-is", func(t *testing.T) {
+		innerErr := errors.New("inner")
+		err := u.compactWithPanicRecovery("op", func() error { return innerErr })
+		require.ErrorIs(t, err, innerErr)
+	})
+
+	t.Run("non-OOO panic is always re-panicked, even when swallow is enabled", func(t *testing.T) {
+		withSwallow(t, true)
+		require.PanicsWithValue(t, "simulated non-OOO panic", func() {
+			_ = u.compactWithPanicRecovery("op", panicOutsideOOO)
+		})
+	})
+
+	t.Run("OOO panic is re-panicked when swallow is disabled", func(t *testing.T) {
+		withSwallow(t, false)
+		require.PanicsWithValue(t, "simulated OOO compaction panic", func() {
+			_ = u.compactWithPanicRecovery("op", fakeOOOPanicker{}.compactOOO)
+		})
+	})
+
+	t.Run("OOO panic is swallowed when enabled", func(t *testing.T) {
+		withSwallow(t, true)
+		require.NotPanics(t, func() {
+			err := u.compactWithPanicRecovery("op", fakeOOOPanicker{}.compactOOO)
+			require.NoError(t, err)
+		})
 	})
 }
