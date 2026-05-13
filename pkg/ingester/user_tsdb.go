@@ -325,12 +325,12 @@ func (u *userTSDB) compactHead(blockDuration, forcedCompactionMaxTime int64) err
 }
 
 // swallowOOOCompactionPanic controls whether a panic from OOO head compaction is
-// logged and re-panicked (false) or logged and swallowed so the ingester can
-// continue (true). When MIMIR_INGESTER_SWALLOW_OOO_COMPACTION_PANIC is set to a
-// truthy value ("1", "t", "true", etc., as parsed by strconv.ParseBool), the panic
-// is logged and OOO data is dropped for this cycle; otherwise the panic is re-raised.
-// Panics from non-OOO compaction code paths are always re-raised regardless of this
-// setting.
+// logged and re-panicked (false) or logged and converted to an error so the
+// ingester can continue (true). When MIMIR_INGESTER_SWALLOW_OOO_COMPACTION_PANIC
+// is set to a truthy value ("1", "t", "true", etc., as parsed by
+// strconv.ParseBool), the panic is logged, OOO data is dropped for this cycle,
+// and an error is returned; otherwise the panic is re-raised. Panics from
+// non-OOO compaction code paths are always re-raised regardless of this setting.
 var swallowOOOCompactionPanic = func() bool {
 	v, _ := strconv.ParseBool(os.Getenv("MIMIR_INGESTER_SWALLOW_OOO_COMPACTION_PANIC"))
 	return v
@@ -339,8 +339,8 @@ var swallowOOOCompactionPanic = func() bool {
 // compactWithPanicRecovery runs the given compaction function and recovers from
 // panics originating in OOO head compaction. Panics from any other code path are
 // always re-panicked. If swallowOOOCompactionPanic is true, an OOO compaction
-// panic is logged and converted to a nil error; otherwise it is re-panicked after
-// logging.
+// panic is logged and returned as an error so the caller can record the failure
+// and move on to other tenants; otherwise it is re-panicked after logging.
 func (u *userTSDB) compactWithPanicRecovery(operation string, fn func() error) (err error) {
 	head := u.Head()
 	start := time.Now()
@@ -375,7 +375,7 @@ func (u *userTSDB) compactWithPanicRecovery(operation string, fn func() error) (
 		if !swallowOOOCompactionPanic {
 			panic(r)
 		}
-		err = nil
+		err = fmt.Errorf("recovered from panic during OOO compaction (entered via %s): %v", operation, r)
 	}()
 	return fn()
 }

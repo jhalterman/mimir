@@ -364,11 +364,14 @@ func TestUserTSDB_compactWithPanicRecovery(t *testing.T) {
 		})
 	})
 
-	t.Run("OOO panic is swallowed when enabled", func(t *testing.T) {
+	t.Run("OOO panic is returned as error when swallow is enabled", func(t *testing.T) {
 		withSwallow(t, true)
+		var err error
 		require.NotPanics(t, func() {
-			err := u.compactWithPanicRecovery("op", fakeOOOPanicker{}.compactOOO)
-			require.NoError(t, err)
+			err = u.compactWithPanicRecovery("op", fakeOOOPanicker{}.compactOOO)
 		})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "recovered from panic during OOO compaction")
+		require.Contains(t, err.Error(), "simulated OOO compaction panic")
 	})
 }
