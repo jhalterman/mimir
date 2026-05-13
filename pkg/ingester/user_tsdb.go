@@ -324,23 +324,43 @@ func (u *userTSDB) compactHead(blockDuration, forcedCompactionMaxTime int64) err
 	})
 }
 
-// swallowOOOCompactionPanic controls whether a panic from OOO head compaction is
-// logged and re-panicked (false) or logged and converted to an error so the
-// ingester can continue (true). When MIMIR_INGESTER_SWALLOW_OOO_COMPACTION_PANIC
-// is set to a truthy value ("1", "t", "true", etc., as parsed by
-// strconv.ParseBool), the panic is logged, OOO data is dropped for this cycle,
-// and an error is returned; otherwise the panic is re-raised. Panics from
-// non-OOO compaction code paths are always re-raised regardless of this setting.
+// swallowOOOCompactionPanic controls whether a panic from OOO head compaction
+// is logged and re-panicked (false) or logged, swallowed, and converted to an
+// error (true). When MIMIR_INGESTER_SWALLOW_OOO_COMPACTION_PANIC is set to a
+// truthy value ("1", "t", "true", etc., as parsed by strconv.ParseBool), the
+// panic is logged and an error is returned; otherwise the panic is re-raised.
+// Panics from non-OOO compaction code paths are always re-raised regardless of
+// this setting.
+//
+// Note: enabling swallow alone keeps the ingester alive but does not unstick
+// the affected tenant - the same OOO head data is re-read every compaction
+// cycle and panics again. Set dropOOOHeadOnCompactionPanic too to also drop the
+// OOO head so the tenant can make forward progress (at the cost of losing the
+// OOO samples currently in the head).
 var swallowOOOCompactionPanic = func() bool {
 	v, _ := strconv.ParseBool(os.Getenv("MIMIR_INGESTER_SWALLOW_OOO_COMPACTION_PANIC"))
+	return v
+}()
+
+// dropOOOHeadOnCompactionPanic controls whether, after swallowing an OOO
+// compaction panic, the in-memory OOO head and its WBL are force-dropped to
+// unstick the tenant. When MIMIR_INGESTER_DROP_OOO_HEAD_ON_COMPACTION_PANIC is
+// set to a truthy value, the OOO samples currently in the head are permanently
+// discarded so the next compaction cycle starts clean. Has no effect unless
+// swallowOOOCompactionPanic is also enabled - panics that aren't being
+// swallowed are re-raised before this check.
+var dropOOOHeadOnCompactionPanic = func() bool {
+	v, _ := strconv.ParseBool(os.Getenv("MIMIR_INGESTER_DROP_OOO_HEAD_ON_COMPACTION_PANIC"))
 	return v
 }()
 
 // compactWithPanicRecovery runs the given compaction function and recovers from
 // panics originating in OOO head compaction. Panics from any other code path are
 // always re-panicked. If swallowOOOCompactionPanic is true, an OOO compaction
-// panic is logged and returned as an error so the caller can record the failure
-// and move on to other tenants; otherwise it is re-panicked after logging.
+// panic is logged and converted to an error so the caller can record the
+// failure and move on to other tenants. If dropOOOHeadOnCompactionPanic is
+// additionally true, the OOO head is force-dropped so the tenant can make
+// forward progress. Otherwise the panic is re-panicked after logging.
 func (u *userTSDB) compactWithPanicRecovery(operation string, fn func() error) (err error) {
 	head := u.Head()
 	start := time.Now()
@@ -356,8 +376,10 @@ func (u *userTSDB) compactWithPanicRecovery(operation string, fn func() error) (
 			panic(r)
 		}
 		msg := fmt.Sprintf("panic during OOO compaction (entered via %s)", operation)
-		if swallowOOOCompactionPanic {
-			msg += "; dropping OOO data for this cycle"
+		if swallowOOOCompactionPanic && dropOOOHeadOnCompactionPanic {
+			msg += "; dropping OOO head data for this tenant"
+		} else if swallowOOOCompactionPanic {
+			msg += "; leaving OOO head data in place (next compaction will retry)"
 		}
 		level.Error(u.logger).Log(
 			"msg", msg,
@@ -375,9 +397,36 @@ func (u *userTSDB) compactWithPanicRecovery(operation string, fn func() error) (
 		if !swallowOOOCompactionPanic {
 			panic(r)
 		}
+
+		// Optionally force-drop the OOO head so the next compaction cycle isn't
+		// a re-run of this panic. If the drop itself panics or errors, log it
+		// but don't crash - we'd rather the ingester stay up and keep serving
+		// queries.
+		if dropOOOHeadOnCompactionPanic {
+			if dropErr := u.forceDropOOOHead(); dropErr != nil {
+				level.Error(u.logger).Log(
+					"msg", "failed to force-drop OOO head after recovered compaction panic",
+					"tenant", u.userID,
+					"err", dropErr,
+				)
+			}
+		}
+
 		err = fmt.Errorf("recovered from panic during OOO compaction (entered via %s): %v", operation, r)
 	}()
 	return fn()
+}
+
+// forceDropOOOHead drops all OOO data currently in the head without writing it
+// to a block, with its own panic recovery so we never crash the ingester from
+// the recovery path. The dropped data is permanently lost.
+func (u *userTSDB) forceDropOOOHead() (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic during OOO head force-drop: %v", r)
+		}
+	}()
+	return u.db.ForceDropOOOInHead(context.Background())
 }
 
 // formatLoadedBlocks returns a compact summary of the given blocks for logging.

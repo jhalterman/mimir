@@ -13,6 +13,7 @@ import (
 	"github.com/prometheus/common/promslog"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/tsdb"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -337,11 +338,16 @@ func TestUserTSDB_compactWithPanicRecovery(t *testing.T) {
 		logger: log.NewNopLogger(),
 	}
 
-	withSwallow := func(t *testing.T, enabled bool) {
+	withFlags := func(t *testing.T, swallow, drop bool) {
 		t.Helper()
-		orig := swallowOOOCompactionPanic
-		t.Cleanup(func() { swallowOOOCompactionPanic = orig })
-		swallowOOOCompactionPanic = enabled
+		origSwallow := swallowOOOCompactionPanic
+		origDrop := dropOOOHeadOnCompactionPanic
+		t.Cleanup(func() {
+			swallowOOOCompactionPanic = origSwallow
+			dropOOOHeadOnCompactionPanic = origDrop
+		})
+		swallowOOOCompactionPanic = swallow
+		dropOOOHeadOnCompactionPanic = drop
 	}
 
 	t.Run("no panic: inner error is returned as-is", func(t *testing.T) {
@@ -350,22 +356,22 @@ func TestUserTSDB_compactWithPanicRecovery(t *testing.T) {
 		require.ErrorIs(t, err, innerErr)
 	})
 
-	t.Run("non-OOO panic is always re-panicked, even when swallow is enabled", func(t *testing.T) {
-		withSwallow(t, true)
+	t.Run("non-OOO panic is always re-panicked, even when swallow and drop are enabled", func(t *testing.T) {
+		withFlags(t, true, true)
 		require.PanicsWithValue(t, "simulated non-OOO panic", func() {
 			_ = u.compactWithPanicRecovery("op", panicOutsideOOO)
 		})
 	})
 
 	t.Run("OOO panic is re-panicked when swallow is disabled", func(t *testing.T) {
-		withSwallow(t, false)
+		withFlags(t, false, true) // drop is irrelevant when swallow is off
 		require.PanicsWithValue(t, "simulated OOO compaction panic", func() {
 			_ = u.compactWithPanicRecovery("op", fakeOOOPanicker{}.compactOOO)
 		})
 	})
 
-	t.Run("OOO panic is returned as error when swallow is enabled", func(t *testing.T) {
-		withSwallow(t, true)
+	t.Run("OOO panic is returned as error when swallow is enabled and drop is disabled", func(t *testing.T) {
+		withFlags(t, true, false)
 		var err error
 		require.NotPanics(t, func() {
 			err = u.compactWithPanicRecovery("op", fakeOOOPanicker{}.compactOOO)
@@ -374,4 +380,108 @@ func TestUserTSDB_compactWithPanicRecovery(t *testing.T) {
 		require.Contains(t, err.Error(), "recovered from panic during OOO compaction")
 		require.Contains(t, err.Error(), "simulated OOO compaction panic")
 	})
+
+	t.Run("OOO panic is returned as error when swallow and drop are both enabled", func(t *testing.T) {
+		withFlags(t, true, true)
+		var err error
+		require.NotPanics(t, func() {
+			err = u.compactWithPanicRecovery("op", fakeOOOPanicker{}.compactOOO)
+		})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "recovered from panic during OOO compaction")
+	})
+}
+
+func TestUserTSDB_forceDropOOOHead(t *testing.T) {
+	opts := tsdb.DefaultOptions()
+	opts.OutOfOrderTimeWindow = (30 * time.Minute).Milliseconds()
+
+	tsdbDB, err := tsdb.Open(t.TempDir(), promslog.NewNopLogger(), nil, opts, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, tsdbDB.Close()) })
+
+	u := &userTSDB{
+		db:     tsdbDB,
+		userID: "test",
+		logger: log.NewNopLogger(),
+	}
+
+	const inOrderTS = int64(2_000_000)
+	const oooTS = int64(1_900_000) // 100s before in-order, well within the 30m window
+	lbls := labels.FromStrings("__name__", "foo")
+
+	app := tsdbDB.Appender(context.Background())
+	_, err = app.Append(0, lbls, inOrderTS, 1.0)
+	require.NoError(t, err)
+	require.NoError(t, app.Commit())
+
+	app = tsdbDB.Appender(context.Background())
+	_, err = app.Append(0, lbls, oooTS, 0.5)
+	require.NoError(t, err)
+	require.NoError(t, app.Commit())
+
+	// Sanity: both samples are queryable before the drop.
+	require.ElementsMatch(t,
+		[]sample{{t: oooTS, v: 0.5}, {t: inOrderTS, v: 1.0}},
+		querySamples(t, tsdbDB, oooTS-1, inOrderTS+1, lbls),
+		"both in-order and OOO samples should be queryable before force-drop",
+	)
+
+	require.NoError(t, u.forceDropOOOHead())
+
+	// After the drop, only the in-order sample is queryable. The OOO sample is gone.
+	require.Equal(t,
+		[]sample{{t: inOrderTS, v: 1.0}},
+		querySamples(t, tsdbDB, oooTS-1, inOrderTS+1, lbls),
+		"only in-order sample should remain after force-drop",
+	)
+
+	require.NoError(t, u.db.CompactOOOHead(context.Background()), "subsequent OOO compaction should be a no-op")
+}
+
+type sample struct {
+	t int64
+	v float64
+}
+
+func querySamples(t *testing.T, db *tsdb.DB, mint, maxt int64, lbls labels.Labels) []sample {
+	t.Helper()
+	q, err := db.Querier(mint, maxt)
+	require.NoError(t, err)
+	// Close immediately - we can't use t.Cleanup here because outstanding queriers
+	// hold OOO chunk references and block (*Head).truncateOOO via
+	// WaitForPendingReadersForOOOChunksAtOrBefore.
+	defer func() { require.NoError(t, q.Close()) }()
+
+	matchers := make([]*labels.Matcher, 0, lbls.Len())
+	lbls.Range(func(l labels.Label) {
+		matchers = append(matchers, labels.MustNewMatcher(labels.MatchEqual, l.Name, l.Value))
+	})
+
+	ss := q.Select(context.Background(), false, nil, matchers...)
+	var out []sample
+	for ss.Next() {
+		it := ss.At().Iterator(nil)
+		for it.Next() == chunkenc.ValFloat {
+			ts, v := it.At()
+			out = append(out, sample{t: ts, v: v})
+		}
+		require.NoError(t, it.Err())
+	}
+	require.NoError(t, ss.Err())
+	return out
+}
+
+func TestUserTSDB_forceDropOOOHead_oooDisabled(t *testing.T) {
+	tsdbDB, err := tsdb.Open(t.TempDir(), promslog.NewNopLogger(), nil, tsdb.DefaultOptions(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, tsdbDB.Close()) })
+
+	u := &userTSDB{
+		db:     tsdbDB,
+		userID: "test",
+		logger: log.NewNopLogger(),
+	}
+
+	require.NoError(t, u.forceDropOOOHead(), "force-drop on a TSDB without OOO enabled should be a no-op")
 }
