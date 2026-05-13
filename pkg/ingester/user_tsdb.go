@@ -9,6 +9,10 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
+	"runtime/debug"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -97,6 +101,7 @@ type userTSDB struct {
 	cfg            *Config
 	db             *tsdb.DB
 	userID         string
+	logger         log.Logger
 	activeSeries   *activeseries.ActiveSeries
 	seriesInMetric *metricCounter
 	limiter        *Limiter
@@ -228,7 +233,9 @@ func (u *userTSDB) Close() error {
 }
 
 func (u *userTSDB) Compact() error {
-	return u.db.Compact(context.Background())
+	return u.compactWithPanicRecovery("TSDB compaction", func() error {
+		return u.db.Compact(context.Background())
+	})
 }
 
 func (u *userTSDB) StartTime() (int64, error) {
@@ -312,7 +319,82 @@ func (u *userTSDB) compactHead(blockDuration, forcedCompactionMaxTime int64) err
 		}
 	}
 
-	return u.db.CompactOOOHead(context.Background())
+	return u.compactWithPanicRecovery("OOO head compaction", func() error {
+		return u.db.CompactOOOHead(context.Background())
+	})
+}
+
+// swallowOOOCompactionPanic controls whether a panic from OOO head compaction is
+// logged and re-panicked (false) or logged and swallowed so the ingester can
+// continue (true). When MIMIR_INGESTER_SWALLOW_OOO_COMPACTION_PANIC is set to a
+// truthy value ("1", "t", "true", etc., as parsed by strconv.ParseBool), the panic
+// is logged and OOO data is dropped for this cycle; otherwise the panic is re-raised.
+// Panics from non-OOO compaction code paths are always re-raised regardless of this
+// setting.
+var swallowOOOCompactionPanic = func() bool {
+	v, _ := strconv.ParseBool(os.Getenv("MIMIR_INGESTER_SWALLOW_OOO_COMPACTION_PANIC"))
+	return v
+}()
+
+// compactWithPanicRecovery runs the given compaction function and recovers from
+// panics originating in OOO head compaction. Panics from any other code path are
+// always re-panicked. If swallowOOOCompactionPanic is true, an OOO compaction
+// panic is logged and converted to a nil error; otherwise it is re-panicked after
+// logging.
+func (u *userTSDB) compactWithPanicRecovery(operation string, fn func() error) (err error) {
+	head := u.Head()
+	start := time.Now()
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		// Only handle panics from OOO compaction; re-panic anything else so we
+		// don't mask unrelated bugs.
+		stack := debug.Stack()
+		if !strings.Contains(string(stack), "compactOOO") {
+			panic(r)
+		}
+		msg := fmt.Sprintf("panic during OOO compaction (entered via %s)", operation)
+		if swallowOOOCompactionPanic {
+			msg += "; dropping OOO data for this cycle"
+		}
+		level.Error(u.logger).Log(
+			"msg", msg,
+			"tenant", u.userID,
+			"panic", fmt.Sprintf("%v", r),
+			"elapsed", time.Since(start),
+			"num_series", head.NumSeries(),
+			"min_time", head.MinTime(),
+			"max_time", head.MaxTime(),
+			"min_ooo_time", head.MinOOOTime(),
+			"max_ooo_time", head.MaxOOOTime(),
+			"loaded_blocks", formatLoadedBlocks(u.Blocks()),
+			"stack", string(stack),
+		)
+		if !swallowOOOCompactionPanic {
+			panic(r)
+		}
+		err = nil
+	}()
+	return fn()
+}
+
+// formatLoadedBlocks returns a compact summary of the given blocks for logging.
+func formatLoadedBlocks(blocks []*tsdb.Block) string {
+	if len(blocks) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	for i, b := range blocks {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		m := b.Meta()
+		fmt.Fprintf(&sb, "%s(mint=%d,maxt=%d,samples=%d,ooo=%t)",
+			m.ULID, m.MinTime, m.MaxTime, m.Stats.NumSamples, m.Compaction.FromOutOfOrder())
+	}
+	return sb.String()
 }
 
 // nextForcedHeadCompactionRange computes the next TSDB head range to compact when a forced compaction
