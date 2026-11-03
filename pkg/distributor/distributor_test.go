@@ -6281,7 +6281,12 @@ type prepConfig struct {
 	ingestStorageEnabled          bool
 	ingestStorageMigrationEnabled bool
 	ingestStoragePartitions       int32 // Number of partitions. Auto-detected from configured ingesters if not explicitly set.
-	ingestStorageKafka            *kfake.Cluster
+	// ingestStorageOneTokenPerPartition gives each partition a single, evenly spaced token instead of the
+	// spread-minimizing ones. Generating spread-minimizing tokens grows quadratically with the number of
+	// partitions, which is too slow for thousands of them. Use it only when the test doesn't depend on how
+	// series are sharded across partitions.
+	ingestStorageOneTokenPerPartition bool
+	ingestStorageKafka                *kfake.Cluster
 
 	// Compartments specific configuration. When numCompartments > 0, the partition rings
 	// component is built with that many read compartment rings, each seeded with the active partitions
@@ -6538,7 +6543,16 @@ func preparePartitionsRing(cfg prepConfig, ingesters []*mockIngester) *ring.Part
 
 	// Add all partitions.
 	for partitionID := int32(0); partitionID < cfg.ingestStoragePartitions; partitionID++ {
-		desc.AddPartition(partitionID, ring.PartitionActive, timeBeforeShuffleShardingLookbackPeriod)
+		if cfg.ingestStorageOneTokenPerPartition {
+			desc.Partitions[partitionID] = ring.PartitionDesc{
+				Id:             partitionID,
+				Tokens:         []uint32{uint32(partitionID) * (math.MaxUint32 / uint32(cfg.ingestStoragePartitions))},
+				State:          ring.PartitionActive,
+				StateTimestamp: timeBeforeShuffleShardingLookbackPeriod.Unix(),
+			}
+		} else {
+			desc.AddPartition(partitionID, ring.PartitionActive, timeBeforeShuffleShardingLookbackPeriod)
+		}
 	}
 
 	// Add all ingesters are partition owners.
