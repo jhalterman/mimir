@@ -3,7 +3,11 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
+	"io"
+	"strings"
 	"fmt"
 	"os"
 	"sync/atomic"
@@ -28,7 +32,8 @@ type SizeConfig struct {
 	// A selector's position in the distribution comes from a hash of its normalized text, so every
 	// partition and every repeat agrees on its size.
 	SeriesQuantiles []QuantilePoint `yaml:"series_quantiles" json:"series_quantiles"`
-	// TableFile optionally maps normalized selector text to cell-wide series. It wins over the
+	// TableFile optionally maps normalized selector text to cell-wide series for one replica (JSON,
+	// gzipped if it ends in .gz; build it with "fake-ingester sizetable"). It wins over the
 	// distribution for selectors it lists.
 	TableFile string `yaml:"table_file" json:"table_file"`
 	// WriteAmplification is the number of replicas a heavy read-tee copy (matchers ending
@@ -176,6 +181,15 @@ func (h *configHolder) set(cfg RuntimeConfig) error {
 		b, err := os.ReadFile(cfg.Sizes.TableFile)
 		if err != nil {
 			return fmt.Errorf("read size table: %w", err)
+		}
+		if strings.HasSuffix(cfg.Sizes.TableFile, ".gz") {
+			zr, err := gzip.NewReader(bytes.NewReader(b))
+			if err != nil {
+				return fmt.Errorf("read size table: %w", err)
+			}
+			if b, err = io.ReadAll(zr); err != nil {
+				return fmt.Errorf("read size table: %w", err)
+			}
 		}
 		if err := json.Unmarshal(b, &st.table); err != nil {
 			return fmt.Errorf("parse size table: %w", err)

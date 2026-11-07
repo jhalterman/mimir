@@ -10,6 +10,7 @@ import (
 	"net"
 	"sort"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -203,6 +204,13 @@ func TestQueryStream_ProtocolAndShape(t *testing.T) {
 		require.Len(t, heavy, 2000)
 		require.Contains(t, perReplica[0].labels.Get(labels.MetricName), "_amp3")
 	})
+
+	t.Run("query-frontend shards split a selector's series", func(t *testing.T) {
+		_, c := startFake(t, s, "zone-a", 2, 1)
+		sharded := queryStream(t, c, now.Add(-time.Minute), now, fanout, labels.MustNewMatcher(labels.MatchEqual, queryShardLabel, "3_of_4"))
+		require.Len(t, sharded, 125)
+		require.Equal(t, parseSelector([]*labels.Matcher{fanout}).key, parseSelector([]*labels.Matcher{fanout, labels.MustNewMatcher(labels.MatchEqual, queryShardLabel, "3_of_4")}).key)
+	})
 }
 
 func TestQueryStream_LargeResponseFlushesBelow1MiB(t *testing.T) {
@@ -304,3 +312,23 @@ func TestLatencyModel(t *testing.T) {
 }
 
 func itoa(i int) string { return strconv.Itoa(i) }
+
+func TestBuildSizeTable(t *testing.T) {
+	in := `{"q":"sum(rate(http_requests_total{job=\"api\"}[5m]))","fs":100,"len":"","n":3}
+{"q":"sum(rate(http_requests_total{job=\"api\"}[5m]))","fs":300,"len":"","n":1}
+{"q":"a / b","fs":50,"len":"1h","n":1}
+{"q":"up","fs":1000,"len":"72h","n":1}
+{"q":"this is not promql(","fs":5,"len":"","n":1}
+`
+	table, st, err := buildSizeTable(strings.NewReader(in))
+	require.NoError(t, err)
+	require.Equal(t, 1, st.ParseErrors)
+
+	key := func(ms ...*labels.Matcher) string { return parseSelector(ms).key }
+	// Weighted median: three samples of 100 outweigh one of 300.
+	require.Equal(t, 100.0, table[key(labels.MustNewMatcher(labels.MatchEqual, "job", "api"), labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "http_requests_total"))])
+	// Split evenly across selectors.
+	require.Equal(t, 25.0, table[key(labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "a"))])
+	// 72h spans three 24h splits; only the newest reaches ingesters.
+	require.Equal(t, 333.0, table[key(labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "up"))])
+}

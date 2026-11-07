@@ -77,4 +77,21 @@ fake-ingester \
 ```
 
 `-first-partition-from-hostname` sets the first partition to the StatefulSet ordinal × `-fakes`, so
-pod 3 with 100 fakes owns partitions 300–399. Metrics are on `-http-listen` at `/metrics`.
+pod 3 with 100 fakes owns partitions 300–399. Add `-pods-per-compartment=N` to also derive the
+compartment (ordinal / N), so one StatefulSet per zone covers every compartment. Metrics are on
+`-http-listen` at `/metrics`.
+
+## Size table
+
+Build the size table from query-frontend `query stats` logs, one JSON object per line with `q`
+(`param_query`), `fs` (`fetched_series_count`), `len` (`length`) and `n` (identical entries):
+
+```
+fake-ingester sizetable < samples.jsonl | gzip > size-table.json.gz
+```
+
+Each query's series are split evenly across its selectors and divided by its 24h time splits, and
+the table keeps the weighted median per normalized selector. Shards (`__query_shard__`) and read-tee
+rewrites are normalized away at lookup, and a sharded selector returns 1/n of its series. The
+table holds one replica's data; heavy read-tee copies multiply it by `sizes.write_amplification`.
+Query texts are internal, so keep the table out of git and ship it as a deploy-time file.

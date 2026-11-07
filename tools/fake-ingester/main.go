@@ -10,6 +10,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -47,6 +48,7 @@ type config struct {
 	Fakes                    int
 	FirstPartition           int
 	PartitionFromHostname    bool
+	PodsPerCompartment       int
 	Zone                     string
 	Compartment              int
 	CompartmentsEnabled      bool
@@ -73,7 +75,8 @@ type config struct {
 func (c *config) registerFlags(f *flag.FlagSet) {
 	f.IntVar(&c.Fakes, "fakes", 100, "Fake ingesters in this process; each owns one partition.")
 	f.IntVar(&c.FirstPartition, "first-partition", 0, "Partition ID of the first fake. The rest follow consecutively.")
-	f.BoolVar(&c.PartitionFromHostname, "first-partition-from-hostname", false, "Set -first-partition to (StatefulSet ordinal of the hostname) × -fakes.")
+	f.BoolVar(&c.PartitionFromHostname, "first-partition-from-hostname", false, "Derive -first-partition (and, with -pods-per-compartment, -compartment) from the StatefulSet ordinal of the hostname.")
+	f.IntVar(&c.PodsPerCompartment, "pods-per-compartment", 0, "With -first-partition-from-hostname: pods per compartment. Pod ordinal k gets compartment k / N and first partition (k % N) × -fakes, so one StatefulSet covers every compartment. 0 keeps -compartment and uses k × -fakes.")
 	f.StringVar(&c.Zone, "zone", "zone-a", "Zone of every fake in this process.")
 	f.IntVar(&c.Compartment, "compartment", 0, "Read compartment of every fake in this process.")
 	f.BoolVar(&c.CompartmentsEnabled, "compartments.enabled", true, "Register under per-compartment partition-ring keys (ingester-partitions-rc-<N>).")
@@ -100,6 +103,22 @@ func (c *config) registerFlags(f *flag.FlagSet) {
 var ordinalRE = regexp.MustCompile(`-([0-9]+)$`)
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "sizetable" {
+		// fake-ingester sizetable < samples.jsonl > table.json
+		table, st, err := buildSizeTable(os.Stdin)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "samples=%d queries=%d parse_errors=%d selectors=%d table_entries=%d\n", st.Samples, st.Queries, st.ParseErrors, st.Selectors, st.Keys)
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", " ")
+		if err := enc.Encode(table); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	var cfg config
 	cfg.registerFlags(flag.CommandLine)
 	flag.Parse()
@@ -119,7 +138,15 @@ func run(cfg config, logger log.Logger) error {
 			return fmt.Errorf("hostname %q has no ordinal suffix", host)
 		}
 		ord, _ := strconv.Atoi(m[1])
-		cfg.FirstPartition = ord * cfg.Fakes
+		if cfg.PodsPerCompartment > 0 {
+			cfg.Compartment = ord / cfg.PodsPerCompartment
+			cfg.FirstPartition = (ord % cfg.PodsPerCompartment) * cfg.Fakes
+			if cfg.Compartment >= cfg.NumCompartments {
+				return fmt.Errorf("pod ordinal %d maps to compartment %d, but -compartments.num is %d", ord, cfg.Compartment, cfg.NumCompartments)
+			}
+		} else {
+			cfg.FirstPartition = ord * cfg.Fakes
+		}
 	}
 	if cfg.AdvertiseAddr == "" {
 		return errors.New("-advertise-addr (or $POD_IP) is required")

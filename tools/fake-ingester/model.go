@@ -49,13 +49,24 @@ type selector struct {
 	metricNames  []string // exact names the selector is limited to, if any
 	kind         copyKind
 	ampSuffixStr string // the _amp{k} suffix of a per-replica copy
+	shards       int    // query-frontend shard count from __query_shard__="i_of_n"; 1 if unsharded
 }
 
+// queryShardLabel is the matcher the query-frontend adds to each shard of a sharded query.
+const queryShardLabel = "__query_shard__"
+
 func parseSelector(ms []*labels.Matcher) selector {
-	var s selector
+	s := selector{shards: 1}
 	parts := make([]string, 0, len(ms))
 	for _, m := range ms {
 		if m.Name == ampLabelName {
+			continue
+		}
+		if m.Name == queryShardLabel {
+			var i, n int
+			if _, err := fmt.Sscanf(m.Value, "%d_of_%d", &i, &n); err == nil && n > 0 {
+				s.shards = n
+			}
 			continue
 		}
 		v := m.Value
@@ -163,6 +174,9 @@ func seriesOnPartition(st *runtimeState, topo Topology, tenant string, s selecto
 	}
 	if s.kind == copyHeavy && st.cfg.Sizes.WriteAmplification > 1 {
 		total *= float64(st.cfg.Sizes.WriteAmplification)
+	}
+	if s.shards > 1 {
+		total /= float64(s.shards)
 	}
 	parts := len(reached) * topo.PartitionsPerCompartment
 	if parts <= 0 {
