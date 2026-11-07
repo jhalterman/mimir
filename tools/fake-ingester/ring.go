@@ -4,6 +4,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/go-kit/log"
@@ -41,6 +43,8 @@ func partitionRingKey(compartmentsEnabled bool, compartment int) string {
 	return compartments.WithReadCompartmentSuffix(partitionRingBaseKey, compartment)
 }
 
+// heartbeat refreshes every fake's registration. The CAS callbacks return (nil, …) to skip an
+// update; their second result asks for a retry on error, it doesn't mean "changed".
 func (r *registrar) heartbeat(ctx context.Context) error {
 	now := time.Now()
 	err := r.instances.CAS(ctx, instanceRingKey, func(in any) (any, bool, error) {
@@ -66,6 +70,7 @@ func (r *registrar) heartbeat(ctx context.Context) error {
 	for _, f := range r.fakes {
 		byCompartment[f.compartment] = append(byCompartment[f.compartment], f)
 	}
+	var errs []error
 	for c, fs := range byCompartment {
 		key := partitionRingKey(r.compartmentsOn, c)
 		err := r.partitions.CAS(ctx, key, func(in any) (any, bool, error) {
@@ -88,13 +93,17 @@ func (r *registrar) heartbeat(ctx context.Context) error {
 					changed = true
 				}
 			}
-			return desc, changed, nil
+			if !changed {
+				// Nothing to update. memberlist rejects a CAS that changes nothing, so return nil to skip it.
+				return nil, false, nil
+			}
+			return desc, true, nil
 		})
 		if err != nil {
-			return err
+			errs = append(errs, fmt.Errorf("%s: %w", key, err))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (r *registrar) run(ctx context.Context, period time.Duration) {

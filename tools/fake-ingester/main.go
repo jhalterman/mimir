@@ -254,7 +254,9 @@ func newGRPCServer(maxStreams uint) *grpc.Server {
 func newKVClients(ctx context.Context, cfg config, reg prometheus.Registerer, logger log.Logger) (kv.Client, kv.Client, func(), error) {
 	stop := func() {}
 	if cfg.InstanceRing.Store == "memberlist" || cfg.PartitionRing.Store == "memberlist" {
-		cfg.Memberlist.Codecs = []codec.Codec{ring.GetCodec(), ring.GetPartitionRingCodec()}
+		// Also decode the propagation-delay tracker key the cell's components gossip, without running
+		// a tracker: otherwise every gossip of it logs "unknown codec".
+		cfg.Memberlist.Codecs = []codec.Codec{ring.GetCodec(), ring.GetPartitionRingCodec(), memberlist.GetPropagationDelayTrackerCodec()}
 		dnsProvider := dns.NewProvider(dns.GolangResolverType, 0, logger, prometheus.WrapRegistererWithPrefix("fake_ingester_", reg))
 		svc := memberlist.NewKVInitService(&cfg.Memberlist, log.With(logger, "component", "memberlist"), dnsProvider, reg)
 		if err := services.StartAndAwaitRunning(ctx, svc); err != nil {
