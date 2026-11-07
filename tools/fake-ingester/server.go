@@ -59,6 +59,10 @@ type serverMetrics struct {
 	duration *prometheus.HistogramVec
 	series   *prometheus.CounterVec
 	inflight prometheus.Gauge
+
+	cacheRequests *prometheus.CounterVec
+	cacheBytes    prometheus.Gauge
+	cacheEntries  prometheus.Gauge
 }
 
 func newServerMetrics(reg prometheus.Registerer) *serverMetrics {
@@ -70,8 +74,12 @@ func newServerMetrics(reg prometheus.Registerer) *serverMetrics {
 		}, []string{"rpc"}),
 		series:   prometheus.NewCounterVec(prometheus.CounterOpts{Name: "fake_ingester_series_returned_total", Help: "Series returned, by RPC."}, []string{"rpc"}),
 		inflight: prometheus.NewGauge(prometheus.GaugeOpts{Name: "fake_ingester_inflight_requests", Help: "Requests in flight across all fakes in this process."}),
+
+		cacheRequests: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "fake_ingester_response_cache_requests_total", Help: "QueryStream response cache lookups, by result (hit or miss)."}, []string{"result"}),
+		cacheBytes:    prometheus.NewGauge(prometheus.GaugeOpts{Name: "fake_ingester_response_cache_bytes", Help: "Bytes held by the QueryStream response cache."}),
+		cacheEntries:  prometheus.NewGauge(prometheus.GaugeOpts{Name: "fake_ingester_response_cache_entries", Help: "Entries in the QueryStream response cache."}),
 	}
-	reg.MustRegister(m.requests, m.duration, m.series, m.inflight)
+	reg.MustRegister(m.requests, m.duration, m.series, m.inflight, m.cacheRequests, m.cacheBytes, m.cacheEntries)
 	return m
 }
 
@@ -128,23 +136,26 @@ type cachedStream struct {
 // responseCache keeps built responses. It's cleared wholesale when it passes its byte budget,
 // which is cheap and rare once the working set of selectors is warm.
 type responseCache struct {
-	mtx    sync.Mutex
-	m      map[string]*cachedStream
-	bytes  int
-	budget int
+	mtx     sync.Mutex
+	m       map[string]*cachedStream
+	bytes   int
+	budget  int
+	metrics *serverMetrics
 }
 
-func newResponseCache(budget int) *responseCache {
-	return &responseCache{m: map[string]*cachedStream{}, budget: budget}
+func newResponseCache(budget int, metrics *serverMetrics) *responseCache {
+	return &responseCache{m: map[string]*cachedStream{}, budget: budget, metrics: metrics}
 }
 
 func (c *responseCache) getOrBuild(key string, build func() *cachedStream) *cachedStream {
 	c.mtx.Lock()
 	if v, ok := c.m[key]; ok {
 		c.mtx.Unlock()
+		c.metrics.cacheRequests.WithLabelValues("hit").Inc()
 		return v
 	}
 	c.mtx.Unlock()
+	c.metrics.cacheRequests.WithLabelValues("miss").Inc()
 	v := build()
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
@@ -154,6 +165,8 @@ func (c *responseCache) getOrBuild(key string, build func() *cachedStream) *cach
 	}
 	c.m[key] = v
 	c.bytes += v.bytes
+	c.metrics.cacheBytes.Set(float64(c.bytes))
+	c.metrics.cacheEntries.Set(float64(len(c.m)))
 	return v
 }
 

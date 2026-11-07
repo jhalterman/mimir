@@ -166,13 +166,14 @@ func run(cfg config, logger log.Logger) error {
 		go reloadLoop(ctx, holder, cfg.RuntimeConfigFile, cfg.RuntimeConfigReload, logger)
 	}
 
+	metrics := newServerMetrics(reg)
 	s := &shared{
 		cfg:     holder,
 		topo:    Topology{NumCompartments: cfg.NumCompartments, PartitionsPerCompartment: cfg.PartitionsPerCompartment},
 		router:  compartments.NewRouter(cfg.NumCompartments),
 		chunks:  newChunkCache(),
-		resps:   newResponseCache(cfg.ResponseCacheBytes),
-		metrics: newServerMetrics(reg),
+		resps:   newResponseCache(cfg.ResponseCacheBytes, metrics),
+		metrics: metrics,
 		now:     time.Now,
 	}
 
@@ -209,7 +210,7 @@ func run(cfg config, logger log.Logger) error {
 		return err
 	}
 	defer stopKV()
-	r := &registrar{instances: instKV, partitions: partKV, fakes: fakes, compartmentsOn: cfg.CompartmentsEnabled, logger: logger}
+	r := &registrar{instances: instKV, partitions: partKV, fakes: fakes, compartmentsOn: cfg.CompartmentsEnabled, logger: logger, metrics: newRegistrarMetrics(reg, len(fakes))}
 	go r.run(ctx, cfg.HeartbeatPeriod)
 
 	// HTTP: metrics, runtime config, readiness.

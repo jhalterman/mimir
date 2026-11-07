@@ -38,13 +38,14 @@ const testTenant = "9960"
 func newTestShared(t *testing.T, rc RuntimeConfig, topo Topology) *shared {
 	h := &configHolder{}
 	require.NoError(t, h.set(rc))
+	metrics := newServerMetrics(prometheus.NewRegistry())
 	return &shared{
 		cfg:     h,
 		topo:    topo,
 		router:  compartments.NewRouter(topo.NumCompartments),
 		chunks:  newChunkCache(),
-		resps:   newResponseCache(64 << 20),
-		metrics: newServerMetrics(prometheus.NewRegistry()),
+		resps:   newResponseCache(64<<20, metrics),
+		metrics: metrics,
 		now:     time.Now,
 	}
 }

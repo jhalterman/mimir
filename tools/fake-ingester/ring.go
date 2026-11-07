@@ -12,6 +12,7 @@ import (
 	"github.com/go-kit/log/level"
 	"github.com/grafana/dskit/kv"
 	"github.com/grafana/dskit/ring"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/grafana/mimir/pkg/compartments"
 )
@@ -28,6 +29,24 @@ type registrar struct {
 	fakes          []*fake
 	compartmentsOn bool
 	logger         log.Logger
+	metrics        *registrarMetrics
+}
+
+type registrarMetrics struct {
+	heartbeats  *prometheus.CounterVec
+	lastSuccess prometheus.Gauge
+	fakes       prometheus.Gauge
+}
+
+func newRegistrarMetrics(reg prometheus.Registerer, fakes int) *registrarMetrics {
+	m := &registrarMetrics{
+		heartbeats:  prometheus.NewCounterVec(prometheus.CounterOpts{Name: "fake_ingester_ring_heartbeats_total", Help: "Ring heartbeats, by result (success or failure)."}, []string{"result"}),
+		lastSuccess: prometheus.NewGauge(prometheus.GaugeOpts{Name: "fake_ingester_ring_last_heartbeat_success_timestamp_seconds", Help: "Unix time of the last heartbeat that updated every ring key."}),
+		fakes:       prometheus.NewGauge(prometheus.GaugeOpts{Name: "fake_ingester_fakes", Help: "Fake ingesters in this process."}),
+	}
+	reg.MustRegister(m.heartbeats, m.lastSuccess, m.fakes)
+	m.fakes.Set(float64(fakes))
+	return m
 }
 
 // Keys the querier reads, as in pkg/ingester (IngesterRingKey, PartitionRingKey).
@@ -112,6 +131,12 @@ func (r *registrar) run(ctx context.Context, period time.Duration) {
 	for {
 		if err := r.heartbeat(ctx); err != nil {
 			level.Warn(r.logger).Log("msg", "ring heartbeat failed", "err", err)
+			if r.metrics != nil {
+				r.metrics.heartbeats.WithLabelValues("failure").Inc()
+			}
+		} else if r.metrics != nil {
+			r.metrics.heartbeats.WithLabelValues("success").Inc()
+			r.metrics.lastSuccess.SetToCurrentTime()
 		}
 		select {
 		case <-ctx.Done():
