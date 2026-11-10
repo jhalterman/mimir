@@ -50,6 +50,17 @@ type selector struct {
 	kind         copyKind
 	ampSuffixStr string // the _amp{k} suffix of a per-replica copy
 	shards       int    // query-frontend shard count from __query_shard__="i_of_n"; 1 if unsharded
+	shardIndex   int    // this request's shard, 0-based
+
+	// Labels the selector pins, so returned series match it the way real ones would: fixed from
+	// equality matchers, and choices from regex alternations (each series takes one value).
+	fixed   []mimirpb.LabelAdapter
+	choices []labelChoice
+}
+
+type labelChoice struct {
+	name   string
+	values []string
 }
 
 // queryShardLabel is the matcher the query-frontend adds to each shard of a sharded query.
@@ -64,8 +75,9 @@ func parseSelector(ms []*labels.Matcher) selector {
 		}
 		if m.Name == queryShardLabel {
 			var i, n int
-			if _, err := fmt.Sscanf(m.Value, "%d_of_%d", &i, &n); err == nil && n > 0 {
+			if _, err := fmt.Sscanf(m.Value, "%d_of_%d", &i, &n); err == nil && n > 0 && i >= 1 && i <= n {
 				s.shards = n
+				s.shardIndex = i - 1
 			}
 			continue
 		}
@@ -81,6 +93,28 @@ func parseSelector(ms []*labels.Matcher) selector {
 			v = v[:loc[0]]
 		}
 		parts = append(parts, m.Name+m.Type.String()+strconv.Quote(v))
+		if m.Name != labels.MetricName {
+			switch m.Type {
+			case labels.MatchEqual:
+				// Keep a per-replica copy's suffix: that replica's series carry it.
+				if m.Value != "" {
+					s.fixed = append(s.fixed, mimirpb.LabelAdapter{Name: strings.Clone(m.Name), Value: strings.Clone(m.Value)})
+				}
+			case labels.MatchRegexp:
+				if rm, err := labels.NewMatcher(labels.MatchRegexp, m.Name, v); err == nil {
+					var values []string
+					for _, x := range rm.SetMatches() {
+						if x != "" {
+							values = append(values, strings.Clone(x))
+						}
+					}
+					if len(values) > 0 {
+						sort.Strings(values)
+						s.choices = append(s.choices, labelChoice{name: strings.Clone(m.Name), values: values})
+					}
+				}
+			}
+		}
 		if m.Name == labels.MetricName {
 			switch m.Type {
 			case labels.MatchEqual:
@@ -194,18 +228,41 @@ func seriesOnPartition(st *runtimeState, topo Topology, tenant string, s selecto
 	return base
 }
 
-// seriesLabels builds a partition's i-th series for a selector. Series are disjoint across
-// partitions (the partition is in the instance label) and identical between zones, and they are
-// generated in sorted order, as the querier's stream merge requires.
+// uniqueLabel carries a series' identity when the selector pins instance.
+const uniqueLabel = "fake_series"
+
+// seriesLabels builds a partition's i-th series for a selector, carrying the labels the selector
+// pins. Series are disjoint across partitions and across query shards (the partition and the
+// series' index in the unsharded selector are in the instance label), and identical between zones.
+// Callers sort them, since a pinned label can vary from series to series.
 func seriesLabels(s selector, metricName string, compartment, partition, i int) []mimirpb.LabelAdapter {
-	inst := fmt.Sprintf("c%03d-p%05d-%08d", compartment, partition, i)
-	job := "fake-job-" + strconv.Itoa(int(hashUnit(s.key, strconv.Itoa(i%997))*200))
-	ls := []mimirpb.LabelAdapter{
-		{Name: labels.MetricName, Value: metricName + s.ampSuffixStr},
-		{Name: "instance", Value: inst},
-		{Name: "job", Value: job},
+	g := i*s.shards + s.shardIndex
+	id := fmt.Sprintf("c%03d-p%05d-%08d", compartment, partition, g)
+	ls := map[string]string{
+		labels.MetricName: metricName + s.ampSuffixStr,
+		"instance":        id,
+		"job":             "fake-job-" + strconv.Itoa(int(hashUnit(s.key, strconv.Itoa(g%997))*200)),
 	}
-	return ls
+	for _, c := range s.choices {
+		ls[c.name] = c.values[g%len(c.values)]
+	}
+	for _, l := range s.fixed {
+		ls[l.Name] = l.Value
+	}
+	if ls["instance"] != id {
+		ls[uniqueLabel] = id
+	}
+	out := make([]mimirpb.LabelAdapter, 0, len(ls))
+	for n, v := range ls {
+		out = append(out, mimirpb.LabelAdapter{Name: n, Value: v})
+	}
+	sort.Slice(out, func(a, b int) bool { return out[a].Name < out[b].Name })
+	return out
+}
+
+// sortSeries orders series the way the querier's stream merge requires.
+func sortSeries(series [][]mimirpb.LabelAdapter) {
+	sort.Slice(series, func(a, b int) bool { return mimirpb.CompareLabelAdapters(series[a], series[b]) < 0 })
 }
 
 // metricNameFor picks the metric a selector's series carry on a compartment: one of the selector's

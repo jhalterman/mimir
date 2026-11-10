@@ -6,10 +6,10 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
-	"io"
-	"strings"
 	"fmt"
+	"io"
 	"os"
+	"strings"
 	"sync/atomic"
 	"time"
 

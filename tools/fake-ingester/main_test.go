@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net"
@@ -208,9 +209,45 @@ func TestQueryStream_ProtocolAndShape(t *testing.T) {
 
 	t.Run("query-frontend shards split a selector's series", func(t *testing.T) {
 		_, c := startFake(t, s, "zone-a", 2, 1)
-		sharded := queryStream(t, c, now.Add(-time.Minute), now, fanout, labels.MustNewMatcher(labels.MatchEqual, queryShardLabel, "3_of_4"))
-		require.Len(t, sharded, 125)
 		require.Equal(t, parseSelector([]*labels.Matcher{fanout}).key, parseSelector([]*labels.Matcher{fanout, labels.MustNewMatcher(labels.MatchEqual, queryShardLabel, "3_of_4")}).key)
+		// Shards are disjoint: concatenating them, as the query-frontend does, never repeats a labelset.
+		seen := map[string]bool{}
+		for i := 1; i <= 4; i++ {
+			shard := queryStream(t, c, now.Add(-time.Minute), now, fanout, labels.MustNewMatcher(labels.MatchEqual, queryShardLabel, fmt.Sprintf("%d_of_4", i)))
+			require.Len(t, shard, 125)
+			for _, x := range shard {
+				k := x.labels.String()
+				require.False(t, seen[k], "shards must not share series: %s", k)
+				seen[k] = true
+			}
+		}
+		require.Len(t, seen, 500)
+	})
+
+	t.Run("series carry the labels the selector pins", func(t *testing.T) {
+		_, c := startFake(t, s, "zone-a", 0, 1)
+		got := queryStream(t, c, now.Add(-time.Minute), now,
+			labels.MustNewMatcher(labels.MatchEqual, "cluster", "prod-1"),
+			labels.MustNewMatcher(labels.MatchRegexp, "app", "web|api"),
+			labels.MustNewMatcher(labels.MatchNotEqual, "namespace", "x"))
+		require.Len(t, got, 500)
+		require.True(t, sort.SliceIsSorted(got, func(i, j int) bool { return labels.Compare(got[i].labels, got[j].labels) < 0 }), "series must be sorted")
+		apps := map[string]int{}
+		for _, x := range got {
+			require.Equal(t, "prod-1", x.labels.Get("cluster"))
+			apps[x.labels.Get("app")]++
+			require.False(t, x.labels.Has("namespace"))
+		}
+		require.Equal(t, map[string]int{"web": 250, "api": 250}, apps)
+
+		// Pinning instance keeps series unique through fake_series.
+		pinned := queryStream(t, c, now.Add(-time.Minute), now, labels.MustNewMatcher(labels.MatchEqual, "instance", "host-1"))
+		seen := map[string]bool{}
+		for _, x := range pinned {
+			require.Equal(t, "host-1", x.labels.Get("instance"))
+			seen[x.labels.String()] = true
+		}
+		require.Len(t, seen, len(pinned))
 	})
 }
 

@@ -200,7 +200,7 @@ func (f *fake) QueryStream(req *client.QueryRequest, stream client.Ingester_Quer
 	if len(chunks) > 0 {
 		firstChunk, lastChunk = chunks[0].StartTimestampMs, chunks[len(chunks)-1].StartTimestampMs
 	}
-	key := fmt.Sprintf("%s|%s|%d|%d|%d|%d|%d|%d|%d", tenant, sel.key, sel.kind, f.compartment, f.partition, n, firstChunk, lastChunk, batch) + sel.ampSuffixStr
+	key := fmt.Sprintf("%s|%s|%d|%d|%d|%d|%d|%d|%d|%d|%d", tenant, sel.key, sel.kind, f.compartment, f.partition, n, firstChunk, lastChunk, batch, sel.shards, sel.shardIndex) + sel.ampSuffixStr
 	cs := f.s.resps.getOrBuild(key, func() *cachedStream {
 		return buildStream(f.s.router, tenant, sel, f.compartment, f.partition, n, chunks, batch)
 	})
@@ -243,9 +243,15 @@ func buildStream(router *compartments.Router, tenant string, sel selector, compa
 	cs := &cachedStream{series: n, chunks: n * len(chunks)}
 	name := metricNameFor(router, tenant, sel, compartment)
 
+	all := make([][]mimirpb.LabelAdapter, n)
+	for i := range all {
+		all[i] = seriesLabels(sel, name, compartment, partition, i)
+	}
+	sortSeries(all)
+
 	var cur []client.QueryStreamSeries
 	for i := 0; i < n; i++ {
-		cur = append(cur, client.QueryStreamSeries{Labels: seriesLabels(sel, name, compartment, partition, i), ChunkCount: int64(len(chunks))})
+		cur = append(cur, client.QueryStreamSeries{Labels: all[i], ChunkCount: int64(len(chunks))})
 		if len(cur) == queryStreamSeriesBatch && i < n-1 {
 			cs.seriesMsgs = append(cs.seriesMsgs, encode(&client.QueryStreamResponse{StreamingSeries: cur}))
 			cur = nil
@@ -295,6 +301,7 @@ func (f *fake) seriesFor(st *runtimeState, tenant string, matchers []*labels.Mat
 	for i := range out {
 		out[i] = seriesLabels(sel, name, f.compartment, f.partition, i)
 	}
+	sortSeries(out)
 	return out
 }
 
