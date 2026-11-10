@@ -228,12 +228,14 @@ func seriesOnPartition(st *runtimeState, topo Topology, tenant string, s selecto
 	return base
 }
 
-// uniqueLabel carries a series' identity when the selector pins instance.
+// uniqueLabel carries every series' identity, so series stay distinct when a query ignores
+// instance and job, or when the selector pins instance.
 const uniqueLabel = "fake_series"
 
 // seriesLabels builds a partition's i-th series for a selector, carrying the labels the selector
 // pins. Series are disjoint across partitions and across query shards (the partition and the
-// series' index in the unsharded selector are in the instance label), and identical between zones.
+// series' index in the unsharded selector are in the instance and fake_series labels), and identical
+// between zones.
 // Callers sort them, since a pinned label can vary from series to series.
 func seriesLabels(s selector, metricName string, compartment, partition, i int) []mimirpb.LabelAdapter {
 	g := i*s.shards + s.shardIndex
@@ -249,9 +251,7 @@ func seriesLabels(s selector, metricName string, compartment, partition, i int) 
 	for _, l := range s.fixed {
 		ls[l.Name] = l.Value
 	}
-	if ls["instance"] != id {
-		ls[uniqueLabel] = id
-	}
+	ls[uniqueLabel] = id
 	out := make([]mimirpb.LabelAdapter, 0, len(ls))
 	for n, v := range ls {
 		out = append(out, mimirpb.LabelAdapter{Name: n, Value: v})

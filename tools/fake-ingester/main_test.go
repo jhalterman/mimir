@@ -240,6 +240,13 @@ func TestQueryStream_ProtocolAndShape(t *testing.T) {
 		}
 		require.Equal(t, map[string]int{"web": 250, "api": 250}, apps)
 
+		// Series stay distinct when a join ignores instance and job, through fake_series.
+		ignoring := map[string]bool{}
+		for _, x := range got {
+			ignoring[labels.NewBuilder(x.labels).Del(labels.MetricName, "instance", "job").Labels().String()] = true
+		}
+		require.Len(t, ignoring, len(got))
+
 		// Pinning instance keeps series unique through fake_series.
 		pinned := queryStream(t, c, now.Add(-time.Minute), now, labels.MustNewMatcher(labels.MatchEqual, "instance", "host-1"))
 		seen := map[string]bool{}
