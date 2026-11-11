@@ -191,6 +191,10 @@ func (f *fake) QueryStream(req *client.QueryRequest, stream client.Ingester_Quer
 	reached := f.s.topo.compartmentsFor(f.s.router, tenant, sel)
 	n := seriesOnPartition(st, f.s.topo, tenant, sel, reached, f.compartment, f.partition)
 	chunks := f.s.chunks.chunksFor(st, from.Time(), to.Time(), now)
+	if len(chunks) == 0 {
+		// Real ingesters only return series with chunks in range, and queriers panic on a series without any.
+		n = 0
+	}
 	batch := int(req.StreamingChunksBatchSize)
 	if batch <= 0 {
 		batch = 256

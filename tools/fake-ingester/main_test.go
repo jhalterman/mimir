@@ -186,11 +186,10 @@ func TestQueryStream_ProtocolAndShape(t *testing.T) {
 		require.Empty(t, queryStream(t, offHome, now.Add(-10*time.Minute), now, m))
 	})
 
-	t.Run("time range beyond the head returns no chunks", func(t *testing.T) {
+	t.Run("time range outside the head returns no series", func(t *testing.T) {
 		_, c := startFake(t, s, "zone-a", 0, 0)
-		got := queryStream(t, c, now.Add(-48*time.Hour), now.Add(-24*time.Hour), fanout)
-		require.Len(t, got, 500)
-		require.Zero(t, got[0].samples)
+		require.Empty(t, queryStream(t, c, now.Add(-48*time.Hour), now.Add(-24*time.Hour), fanout))
+		require.Empty(t, queryStream(t, c, now.Add(time.Hour), now.Add(2*time.Hour), fanout))
 	})
 
 	t.Run("read-tee copies", func(t *testing.T) {
