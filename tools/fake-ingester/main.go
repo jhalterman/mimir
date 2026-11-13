@@ -45,27 +45,28 @@ import (
 )
 
 type config struct {
-	Fakes                    int
-	FirstPartition           int
-	PartitionFromHostname    bool
-	PodsPerCompartment       int
-	Zone                     string
-	Compartment              int
-	CompartmentsEnabled      bool
-	NumCompartments          int
-	PartitionsPerCompartment int
-	InstancePrefix           string
-	AdvertiseAddr            string
-	ListenAddr               string
-	BasePort                 int
-	HTTPListen               string
-	HeartbeatPeriod          time.Duration
-	RuntimeConfigFile        string
-	RuntimeConfigReload      time.Duration
-	ResponseCacheBytes       int
-	MaxConcurrentStreams     uint
-	UnregisterOnExit         bool
-	RemovePartitionsOnExit   bool
+	Fakes                      int
+	FirstPartition             int
+	PartitionFromHostname      bool
+	PodsPerCompartment         int
+	Zone                       string
+	Compartment                int
+	CompartmentsEnabled        bool
+	NumCompartments            int
+	PartitionsPerCompartment   int
+	InstancePrefix             string
+	AdvertiseAddr              string
+	ListenAddr                 string
+	BasePort                   int
+	HTTPListen                 string
+	HeartbeatPeriod            time.Duration
+	RuntimeConfigFile          string
+	RuntimeConfigReload        time.Duration
+	ResponseCacheBytes         int
+	MaxConcurrentStreams       uint
+	UnregisterOnExit           bool
+	UnregisterPropagationDelay time.Duration
+	RemovePartitionsOnExit     bool
 
 	InstanceRing  kv.Config
 	PartitionRing kv.Config
@@ -93,6 +94,7 @@ func (c *config) registerFlags(f *flag.FlagSet) {
 	f.IntVar(&c.ResponseCacheBytes, "response-cache-bytes", 1<<30, "Byte budget for cached QueryStream responses.")
 	f.UintVar(&c.MaxConcurrentStreams, "grpc-max-concurrent-streams", 10000, "Max concurrent gRPC streams per connection.")
 	f.BoolVar(&c.UnregisterOnExit, "unregister-on-exit", true, "Remove instances and partition owners from the rings on exit.")
+	f.DurationVar(&c.UnregisterPropagationDelay, "unregister-propagation-delay", 5*time.Second, "With -unregister-on-exit: how long to keep serving and gossiping after unregistering, so the removal reaches the queriers before this process leaves memberlist.")
 	f.BoolVar(&c.RemovePartitionsOnExit, "remove-partitions-on-exit", false, "Also remove partitions on exit (final teardown only).")
 
 	c.InstanceRing.RegisterFlagsWithPrefix("ring.", "fake-collectors/", f)
@@ -204,8 +206,9 @@ func run(cfg config, logger log.Logger) error {
 	}
 	level.Info(logger).Log("msg", "fake ingesters listening", "fakes", len(fakes), "first_partition", cfg.FirstPartition, "zone", cfg.Zone, "compartment", cfg.Compartment, "base_port", cfg.BasePort)
 
-	// Ring registration.
-	instKV, partKV, stopKV, err := newKVClients(ctx, cfg, reg, logger)
+	// Ring registration. Memberlist runs on its own context, not ctx: SIGTERM cancels ctx, and the
+	// KV must keep gossiping until the unregister below has propagated.
+	instKV, partKV, stopKV, err := newKVClients(context.Background(), cfg, reg, logger)
 	if err != nil {
 		return err
 	}
@@ -227,6 +230,9 @@ func run(cfg config, logger log.Logger) error {
 		uctx, ucancel := context.WithTimeout(context.Background(), 20*time.Second)
 		if err := r.unregister(uctx, cfg.RemovePartitionsOnExit); err != nil {
 			level.Warn(logger).Log("msg", "unregister failed", "err", err)
+		} else {
+			level.Info(logger).Log("msg", "unregistered from the rings", "fakes", len(fakes))
+			time.Sleep(cfg.UnregisterPropagationDelay)
 		}
 		ucancel()
 	}
